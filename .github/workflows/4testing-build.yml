@@ -1,5 +1,14 @@
 ### This workflow setup instance then build and push images ###
 name: 4testing multiarch-build
+run-name: >-
+  Build #${{ inputs.build }} [
+  ${{ inputs.amd64 && 'AMD64' || '-' }}
+  ${{ inputs.arm64 && 'ARM64' || '-' }}
+  ] [
+  ${{ inputs.community && 'CE' || '-' }}
+  ${{ inputs.developer && 'DE' || '-' }}
+  ${{ inputs.enterprise && 'EE' || '-' }}
+  ]
 
 on:
   workflow_dispatch:
@@ -38,30 +47,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - id: matrix
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
+          AMD64: ${{ github.event.inputs.amd64 }}
+          ARM64: ${{ github.event.inputs.arm64 }}
+          COMMUNITY: ${{ github.event.inputs.community }}
+          ENTERPRISE: ${{ github.event.inputs.enterprise }}
+          DEVELOPER: ${{ github.event.inputs.developer }}
         run: |
           set -ex
 
-          BRANCH_NAME=${GITHUB_REF#refs/heads/}
-          if ! [[ $BRANCH_NAME == develop || $BRANCH_NAME =~ hotfix || $BRANCH_NAME =~ release ]]; then
+          if ! [[ "$BRANCH_NAME" == develop || "$BRANCH_NAME" =~ hotfix || "$BRANCH_NAME" =~ release ]]; then
             echo "Wrong branch."
             exit 1
           fi
 
-          [ ${{ github.event.inputs.amd64 }} = true ] && PLATFORMS+=("amd64")
-          [ ${{ github.event.inputs.arm64 }} = true ] && PLATFORMS+=("arm64")
+          [ "${AMD64}" = true ] && PLATFORMS+=("amd64")
+          [ "${ARM64}" = true ] && PLATFORMS+=("arm64")
           if [ -z ${PLATFORMS} ]; then
             echo "None of the platforms are selected."
             exit 1
           fi
 
-          [ ${{ github.event.inputs.community }} = true ] && EDITIONS+=("community")
-          [ ${{ github.event.inputs.enterprise }} = true ] && EDITIONS+=("enterprise")
-          [ ${{ github.event.inputs.developer }} = true ] && EDITIONS+=("developer")
+          [ "${COMMUNITY}" = true ] && EDITIONS+=("community")
+          [ "${ENTERPRISE}" = true ] && EDITIONS+=("enterprise")
+          [ "${DEVELOPER}" = true ] && EDITIONS+=("developer")
           if [ -z ${EDITIONS} ]; then
             echo "None of the editions are selected."
             exit 1
           fi
-          echo "::set-output name=editions::$(jq -n -c --arg s "${EDITIONS[*]}" '($s|split(" "))')"
+          echo "editions=$(jq -n -c --arg s "${EDITIONS[*]}" '($s|split(" "))')" >> $GITHUB_OUTPUT
     outputs:
       editions: ${{ steps.matrix.outputs.editions }}
 
@@ -92,12 +107,21 @@ jobs:
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
 
       - name: Build 4testing
+        id: build-ds
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
+          AMD64: ${{ github.event.inputs.amd64 }}
+          ARM64: ${{ github.event.inputs.arm64 }}
+          BUILD_NUMBER: ${{ github.event.inputs.build }}
+          EDITION: ${{ matrix.edition }}
+          IMAGE: ${{ matrix.image }}
+          PACKAGE_BASEURL: ${{ secrets.REPO_BASEURL }}
         run: |
           set -eux
 
           ### ==>> At this step build variable declaration ###
 
-          case ${{ matrix.edition }} in
+          case "${EDITION}" in
             community)
               PRODUCT_EDITION=""
               ;;
@@ -109,23 +133,20 @@ jobs:
               ;;
           esac
 
-          [ ${{ github.event.inputs.amd64 }} = true ] && PLATFORMS+=("amd64")
-          [ ${{ github.event.inputs.arm64 }} = true ] && PLATFORMS+=("arm64")
+          [ "${AMD64}" = true ] && PLATFORMS+=("amd64")
+          [ "${ARM64}" = true ] && PLATFORMS+=("arm64")
           PLATFORM=$(echo ${PLATFORMS[*]/#/linux/} | tr ' ' ',')
 
-          BRANCH_NAME=${GITHUB_REF#refs/heads/}
-          if [ $BRANCH_NAME = develop ]; then
+          if [ "$BRANCH_NAME" = develop ]; then
             BUILD_CHANNEL=nightly
             PRODUCT_VERSION=99.99.99
-          elif [[ $BRANCH_NAME =~ hotfix || $BRANCH_NAME =~ release ]]; then
+          elif [[ "$BRANCH_NAME" =~ hotfix || "$BRANCH_NAME" =~ release ]]; then
             BUILD_CHANNEL=test
             PRODUCT_VERSION=${BRANCH_NAME#*/v}
           fi
-          BUILD_NUMBER=${{ github.event.inputs.build }}
 
           export PRODUCT_EDITION
-          export PACKAGE_VERSION=${PRODUCT_VERSION}-${BUILD_NUMBER}~stretch
-          export PACKAGE_BASEURL=${{ secrets.REPO_BASEURL }}/${BUILD_CHANNEL}
+          export PACKAGE_VERSION=${PRODUCT_VERSION}-${BUILD_NUMBER}
           export BUILD_CHANNEL
           export PLATFORM
           export DOCKERFILE=Dockerfile
@@ -134,6 +155,32 @@ jobs:
 
           ### ==>> Build and push images at this step ###
 
-          docker buildx bake -f docker-bake.hcl ${{ matrix.image }} --push
+          docker buildx bake --sbom=true --provenance=mode=max -f docker-bake.hcl "${IMAGE}" --push
           echo "DONE: Build success"
+
+          ### Set output for Zap scanner
+          ### NOTE: Output will be used only in release/hotfix branches
+          
+          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH_NAME}" >> "$GITHUB_OUTPUT"
         shell: bash
+
+      # Run scanner only when edition is community 
+      # and branch hit release/ or hotfix/
+      - name: Trigger zap manualy
+        if: >-
+             matrix.edition == 'community' &&
+             (startsWith(steps.build-ds.outputs.branch, 'release/') ||
+              startsWith(steps.build-ds.outputs.branch, 'hotfix/'))
+        env:
+          VERSION: ${{ steps.build-ds.outputs.version }}
+          BRANCH: ${{ steps.build-ds.outputs.branch }}
+          GITHUB_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+            gh workflow run zap-ds.yaml \
+                 --repo "${REPO}" \
+                 -f branch="${BRANCH}" \
+                 -f version="${VERSION}"
+        shell: bash
+

@@ -1,5 +1,6 @@
 ### This workflow setup instance then build and push images ###
 name: Multi-arch build stable
+run-name: ${{ inputs.tag }} (${{ inputs.release_number }})
 
 on:
   workflow_dispatch:
@@ -8,10 +9,23 @@ on:
         description: 'Tag for release (ex. 1.2.3.45)'
         type: string
         required: true
+      release_number:
+        description: 'Sequence number of the release (ex. x.x.x.<number>)'
+        type: string
+        required: true
+        default: '1'
+      latest:
+        description: 'Push latest tag?'
+        type: boolean
+        required: true
+        default: true
 
 env:
   COMPANY_NAME: "onlyoffice"
-  PRODUCT_NAME: "documentserver" 
+  PRODUCT_NAME: "documentserver"
+  VERSION: ${{ github.event.inputs.tag }}
+  RELEASE_NUMBER: ${{ github.event.inputs.release_number }}
+  LATEST: ${{ github.event.inputs.latest }}
 
 jobs:
   build:
@@ -39,19 +53,28 @@ jobs:
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
 
       - name: Build documentserver-release
+        env:
+          TARGET: ${{ matrix.images }}
+          PRODUCT_EDITION: ${{ matrix.edition }}
         run: |
           set -eux
-          VERSION=${{ github.event.inputs.tag }}
-          PRODUCT_EDITION=${{ matrix.edition }}
           TESTING_IMAGE=${COMPANY_NAME}/4testing-${PRODUCT_NAME}${PRODUCT_EDITION}
             export PRODUCT_EDITION
-            export TAG=${VERSION}
+            export PULL_TAG=${VERSION}
+            export TAG=${VERSION%.*}.${RELEASE_NUMBER}
             export SHORTER_TAG=${VERSION%.*}
             export SHORTEST_TAG=${VERSION%.*.*}
-            docker buildx bake -f docker-bake.hcl ${{ matrix.images }} --push
+            docker buildx bake --sbom=true --provenance=mode=max -f docker-bake.hcl "${TARGET}" --push
             echo "DONE: Build success >> exit with 0"
             exit 0
         shell: bash
+
+      - name: Update Docker Hub README
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+          repository: ${{ env.COMPANY_NAME }}/${{ env.PRODUCT_NAME }}${{ matrix.edition }}
 
   build-nonexample:
     name: "Release image: DocumentServer${{ matrix.edition }}-nonExample"
@@ -80,11 +103,14 @@ jobs:
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
 
       - name: build image
+        env:
+          TARGET: ${{ matrix.images }}
+          PRODUCT_EDITION: ${{ matrix.edition }}
         run: |
           set -eux
-          export PRODUCT_EDITION=${{ matrix.edition }}
-          export TAG=${{ github.event.inputs.tag }}
-          docker buildx bake -f docker-bake.hcl ${{ matrix.images }} --push
+          export PULL_TAG=${VERSION%.*}.${RELEASE_NUMBER}
+          export TAG=${VERSION%.*}.${RELEASE_NUMBER}
+          docker buildx bake --sbom=true --provenance=mode=max -f docker-bake.hcl "${TARGET}" --push
         shell: bash
 
   build-ucs-ubuntu20:
@@ -111,14 +137,16 @@ jobs:
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
 
       - name: build UCS
+        env:
+          PACKAGE_BASEURL: ${{ secrets.REPO_BASEURL }}
+          PRODUCT_EDITION: ${{ matrix.edition }}
         run: |
            set -eux
-           export PRODUCT_EDITION=${{ matrix.edition }}
-           export PACKAGE_BASEURL=${{ secrets.REPO_BASEURL }}/test
            export DOCKERFILE=Dockerfile
-           export BASE_IMAGE=ubuntu:20.04
+           export BASE_VERSION=20.04
            export PG_VERSION=12
-           export TAG=${{ github.event.inputs.tag }}
-           export PACKAGE_VERSION=$( echo ${TAG} |  sed -E 's/(.*)\./\1-/')~stretch
-           docker buildx bake -f docker-bake.hcl documentserver-ucs --push
+           export PACKAGE_SUFFIX=
+           export TAG=${VERSION%.*}.${RELEASE_NUMBER}
+           export PACKAGE_VERSION=$( echo ${VERSION} |  sed -E 's/(.*)\./\1-/')
+           docker buildx bake --sbom=true --provenance=mode=max -f docker-bake.hcl documentserver-ucs --push
         shell: bash

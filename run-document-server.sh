@@ -2,11 +2,21 @@
 
 umask 0022
 
-function clean_exit {
-  /usr/bin/documentserver-prepare4shutdown.sh
+start_process() {
+  "$@" &
+  CHILD=$!; wait "$CHILD"; CHILD="";
 }
 
-trap clean_exit SIGTERM
+function clean_exit {
+  [[ -z "$CHILD" ]] || kill -s SIGTERM "$CHILD" 2>/dev/null
+  if [ ${ONLYOFFICE_DATA_CONTAINER} == "false" ] && \
+  [ ${ONLYOFFICE_DATA_CONTAINER_HOST} == "localhost" ]; then
+    /usr/bin/documentserver-prepare4shutdown.sh
+  fi
+  exit
+}
+
+trap clean_exit SIGTERM SIGQUIT SIGABRT SIGINT
 
 # Define '**' behavior explicitly
 shopt -s globstar
@@ -20,7 +30,9 @@ DS_LOG_DIR="${LOG_DIR}/documentserver"
 LIB_DIR="/var/lib/${COMPANY_NAME}"
 DS_LIB_DIR="${LIB_DIR}/documentserver"
 CONF_DIR="/etc/${COMPANY_NAME}/documentserver"
+SUPERVISOR_CONF_DIR="/etc/supervisor/conf.d"
 IS_UPGRADE="false"
+PLUGINS_ENABLED=${PLUGINS_ENABLED:-true}
 
 ONLYOFFICE_DATA_CONTAINER=${ONLYOFFICE_DATA_CONTAINER:-false}
 ONLYOFFICE_DATA_CONTAINER_HOST=${ONLYOFFICE_DATA_CONTAINER_HOST:-localhost}
@@ -39,12 +51,11 @@ if [ "${RELEASE_DATE}" != "${PREV_RELEASE_DATE}" ]; then
   fi
 fi
 
-SSL_CERTIFICATES_DIR="/usr/share/ca-certificates/ds"
-mkdir -p ${SSL_CERTIFICATES_DIR}
-if [[ -d ${DATA_DIR}/certs ]] && [ -e ${DATA_DIR}/certs/*.crt ]; then
-  cp -f ${DATA_DIR}/certs/* ${SSL_CERTIFICATES_DIR}
-  chmod 644 ${SSL_CERTIFICATES_DIR}/*.crt ${SSL_CERTIFICATES_DIR}/*.pem
-  chmod 400 ${SSL_CERTIFICATES_DIR}/*.key
+SSL_CERTIFICATES_DIR="/usr/share/ca-certificates/ds"; mkdir -p ${SSL_CERTIFICATES_DIR}
+find "${DATA_DIR}/certs" -type f \( -iname '*.crt' -o -iname '*.pem' -o -iname '*.key' \) -exec cp -f {} "${SSL_CERTIFICATES_DIR}"/ \;
+if find "${SSL_CERTIFICATES_DIR}" -maxdepth 1 -type f | read _; then
+  find "${SSL_CERTIFICATES_DIR}" -type f \( -iname '*.crt' -o -iname '*.pem' \) -exec chmod 644 {} \;
+  find "${SSL_CERTIFICATES_DIR}" -type f -iname '*.key' -exec chmod 400 {} \;
 fi
 
 if [[ -z $SSL_CERTIFICATE_PATH ]] && [[ -f ${SSL_CERTIFICATES_DIR}/${COMPANY_NAME}.crt ]]; then
@@ -57,6 +68,25 @@ if [[ -z $SSL_KEY_PATH ]] && [[ -f ${SSL_CERTIFICATES_DIR}/${COMPANY_NAME}.key ]
 else
   SSL_KEY_PATH=${SSL_KEY_PATH:-${SSL_CERTIFICATES_DIR}/tls.key}
 fi
+
+#When set, the well known "root" CAs will be extended with the extra certificates in file
+NODE_EXTRA_CA_CERTS=${NODE_EXTRA_CA_CERTS:-${SSL_CERTIFICATES_DIR}/extra-ca-certs.pem}
+if [[ -f ${NODE_EXTRA_CA_CERTS} ]]; then
+  NODE_EXTRA_ENVIRONMENT="${NODE_EXTRA_CA_CERTS}"
+elif [[ -f ${SSL_CERTIFICATE_PATH} ]]; then
+  SSL_CERTIFICATE_SUBJECT=$(openssl x509 -subject -noout -in "${SSL_CERTIFICATE_PATH}" | sed 's/subject=//')
+  SSL_CERTIFICATE_ISSUER=$(openssl x509 -issuer -noout -in "${SSL_CERTIFICATE_PATH}" | sed 's/issuer=//')
+
+  #Add self-signed certificate to trusted list for validating Docs requests to the test example 
+  if [[ -n $SSL_CERTIFICATE_SUBJECT && $SSL_CERTIFICATE_SUBJECT == $SSL_CERTIFICATE_ISSUER ]]; then
+    NODE_EXTRA_ENVIRONMENT="${SSL_CERTIFICATE_PATH}"
+  fi
+fi
+
+if [[ -n $NODE_EXTRA_ENVIRONMENT ]]; then
+  sed -i "s|^environment=.*$|&,NODE_EXTRA_CA_CERTS=${NODE_EXTRA_ENVIRONMENT}|" /etc/supervisor/conf.d/*.conf
+fi
+
 CA_CERTIFICATES_PATH=${CA_CERTIFICATES_PATH:-${SSL_CERTIFICATES_DIR}/ca-certificates.pem}
 SSL_DHPARAM_PATH=${SSL_DHPARAM_PATH:-${SSL_CERTIFICATES_DIR}/dhparam.pem}
 SSL_VERIFY_CLIENT=${SSL_VERIFY_CLIENT:-off}
@@ -73,8 +103,11 @@ NGINX_ONLYOFFICE_EXAMPLE_CONF="${NGINX_ONLYOFFICE_EXAMPLE_PATH}/includes/ds-exam
 
 NGINX_CONFIG_PATH="/etc/nginx/nginx.conf"
 NGINX_WORKER_PROCESSES=${NGINX_WORKER_PROCESSES:-1}
+NGINX_ACCESS_LOG=${NGINX_ACCESS_LOG:-false}
 # Limiting the maximum number of simultaneous connections due to possible memory shortage
-[ $(ulimit -n) -gt 1048576 ] && NGINX_WORKER_CONNECTIONS=${NGINX_WORKER_CONNECTIONS:-1048576} || NGINX_WORKER_CONNECTIONS=${NGINX_WORKER_CONNECTIONS:-$(ulimit -n)}
+LIMIT=$(ulimit -n); [ $LIMIT -gt 1048576 ] && LIMIT=1048576
+NGINX_WORKER_CONNECTIONS=${NGINX_WORKER_CONNECTIONS:-$LIMIT}
+RABBIT_CONNECTIONS=${RABBIT_CONNECTIONS:-$LIMIT}
 
 JWT_ENABLED=${JWT_ENABLED:-false}
 
@@ -92,6 +125,8 @@ JWT_HEADER=${JWT_HEADER:-Authorization}
 JWT_IN_BODY=${JWT_IN_BODY:-false}
 
 WOPI_ENABLED=${WOPI_ENABLED:-false}
+ALLOW_META_IP_ADDRESS=${ALLOW_META_IP_ADDRESS:-false}
+ALLOW_PRIVATE_IP_ADDRESS=${ALLOW_PRIVATE_IP_ADDRESS:-false}
 
 GENERATE_FONTS=${GENERATE_FONTS:-true}
 
@@ -148,6 +183,15 @@ read_setting(){
       ;;
     "mariadb"|"mysql")
       DB_PORT=${DB_PORT:-"3306"}
+      ;;
+    "dameng")
+      DB_PORT=${DB_PORT:-"5236"}
+      ;;
+    "mssql")
+      DB_PORT=${DB_PORT:-"1433"}
+      ;;
+    "oracle")
+      DB_PORT=${DB_PORT:-"1521"}
       ;;
     "")
       DB_PORT=${DB_PORT:-${POSTGRESQL_SERVER_PORT:-$(${JSON} services.CoAuthoring.sql.dbPort)}}
@@ -227,8 +271,30 @@ waiting_for_connection(){
   done
 }
 
+waiting_for_db_ready(){
+  case $DB_TYPE in
+    "oracle")
+      ORACLE_SQL="sqlplus $DB_USER/$DB_PWD@//$DB_HOST:$DB_PORT/${DB_NAME}"
+      DB_TEST="echo \"SELECT version FROM V\$INSTANCE;\" | $ORACLE_SQL 2>/dev/null | grep \"Connected\" | wc -l"
+      ;;
+    *)
+      return
+      ;;
+  esac
+
+  for (( i=1; i <= 10; i++ )); do
+    RES=$(eval $DB_TEST)
+    if [ "$RES" -ne "0" ]; then
+      echo "Database is ready"
+      break
+    fi
+    sleep 5
+  done
+}
+
 waiting_for_db(){
   waiting_for_connection $DB_HOST $DB_PORT
+  waiting_for_db_ready
 }
 
 waiting_for_amqp(){
@@ -248,6 +314,7 @@ update_statsd_settings(){
   ${JSON} -I -e "this.statsd.host = '${METRICS_HOST}'"
   ${JSON} -I -e "this.statsd.port = '${METRICS_PORT}'"
   ${JSON} -I -e "this.statsd.prefix = '${METRICS_PREFIX}'"
+  sed -i -E "s/(autostart|autorestart)=.*$/\1=${METRICS_ENABLED}/g" ${SUPERVISOR_CONF_DIR}/ds-metrics.conf
 }
 
 update_db_settings(){
@@ -308,10 +375,11 @@ update_redis_settings(){
   ${JSON} -I -e "this.services.CoAuthoring.redis.host = '${REDIS_SERVER_HOST}'"
   ${JSON} -I -e "this.services.CoAuthoring.redis.port = '${REDIS_SERVER_PORT}'"
 
-  if [ -n "${REDIS_SERVER_PASS}" ]; then
-    ${JSON} -I -e "this.services.CoAuthoring.redis.options = {'password':'${REDIS_SERVER_PASS}'}"
-  fi
-
+  ${JSON} -I -e  "this.services.CoAuthoring.redis.options = {
+    ${REDIS_SERVER_USER:+username: '${REDIS_SERVER_USER}',}
+    ${REDIS_SERVER_PASS:+password: '${REDIS_SERVER_PASS}',}
+    ${REDIS_SERVER_DB:+database: '${REDIS_SERVER_DB}',}
+  }"
 }
 
 update_ds_settings(){
@@ -322,6 +390,7 @@ update_ds_settings(){
   ${JSON} -I -e "this.services.CoAuthoring.secret.inbox.string = '${JWT_SECRET}'"
   ${JSON} -I -e "this.services.CoAuthoring.secret.outbox.string = '${JWT_SECRET}'"
   ${JSON} -I -e "this.services.CoAuthoring.secret.session.string = '${JWT_SECRET}'"
+  ${JSON} -I -e "this.services.CoAuthoring.secret.browser.string = '${JWT_SECRET}'"
 
   ${JSON} -I -e "this.services.CoAuthoring.token.inbox.header = '${JWT_HEADER}'"
   ${JSON} -I -e "this.services.CoAuthoring.token.outbox.header = '${JWT_HEADER}'"
@@ -340,9 +409,29 @@ update_ds_settings(){
     ${JSON} -I -e "if(this.services.CoAuthoring.requestDefaults.rejectUnauthorized===undefined)this.services.CoAuthoring.requestDefaults.rejectUnauthorized=false"
   fi
 
-  if [ "${WOPI_ENABLED}" == "true" ]; then
-    ${JSON} -I -e "if(this.wopi===undefined)this.wopi={}"
-    ${JSON} -I -e "this.wopi.enable = true"
+  WOPI_PRIVATE_KEY="${DATA_DIR}/wopi_private.key"
+  WOPI_PUBLIC_KEY="${DATA_DIR}/wopi_public.key"
+
+  [ ! -f "${WOPI_PRIVATE_KEY}" ] && echo -n "Generating WOPI private key..." && openssl genpkey -algorithm RSA -outform PEM -out "${WOPI_PRIVATE_KEY}" >/dev/null 2>&1 && echo "Done"
+  [ ! -f "${WOPI_PUBLIC_KEY}" ] && echo -n "Generating WOPI public key..." && openssl rsa -RSAPublicKey_out -in "${WOPI_PRIVATE_KEY}" -outform "MS PUBLICKEYBLOB" -out "${WOPI_PUBLIC_KEY}" >/dev/null 2>&1  && echo "Done"
+  WOPI_MODULUS=$(openssl rsa -pubin -inform "MS PUBLICKEYBLOB" -modulus -noout -in "${WOPI_PUBLIC_KEY}" | sed 's/Modulus=//' | xxd -r -p | openssl base64 -A)
+  WOPI_EXPONENT=$(openssl rsa -pubin -inform "MS PUBLICKEYBLOB" -text -noout -in "${WOPI_PUBLIC_KEY}" | grep -oP '(?<=Exponent: )\d+')
+  
+  ${JSON} -I -e "if(this.wopi===undefined)this.wopi={};"
+  ${JSON} -I -e "this.wopi.enable = ${WOPI_ENABLED}"
+  ${JSON} -I -e "this.wopi.privateKey = '$(awk '{printf "%s\\n", $0}' ${WOPI_PRIVATE_KEY})'"
+  ${JSON} -I -e "this.wopi.privateKeyOld = '$(awk '{printf "%s\\n", $0}' ${WOPI_PRIVATE_KEY})'"
+  ${JSON} -I -e "this.wopi.publicKey = '$(openssl base64 -in ${WOPI_PUBLIC_KEY} -A)'"
+  ${JSON} -I -e "this.wopi.publicKeyOld = '$(openssl base64 -in ${WOPI_PUBLIC_KEY} -A)'"
+  ${JSON} -I -e "this.wopi.modulus = '${WOPI_MODULUS}'"
+  ${JSON} -I -e "this.wopi.modulusOld = '${WOPI_MODULUS}'"
+  ${JSON} -I -e "this.wopi.exponent = ${WOPI_EXPONENT}"
+  ${JSON} -I -e "this.wopi.exponentOld = ${WOPI_EXPONENT}"
+
+  if [ "${ALLOW_META_IP_ADDRESS}" = "true" ] || [ "${ALLOW_PRIVATE_IP_ADDRESS}" = "true" ]; then
+    ${JSON} -I -e "if(this.services.CoAuthoring['request-filtering-agent']===undefined)this.services.CoAuthoring['request-filtering-agent']={}"
+    [ "${ALLOW_META_IP_ADDRESS}" = "true" ] && ${JSON} -I -e "this.services.CoAuthoring['request-filtering-agent'].allowMetaIPAddress = true"
+    [ "${ALLOW_PRIVATE_IP_ADDRESS}" = "true" ] && ${JSON} -I -e "this.services.CoAuthoring['request-filtering-agent'].allowPrivateIPAddress = true"
   fi
 }
 
@@ -358,9 +447,12 @@ create_postgresql_cluster(){
 }
 
 create_postgresql_db(){
-  sudo -u postgres psql -c "CREATE DATABASE $DB_NAME;"
   sudo -u postgres psql -c "CREATE USER $DB_USER WITH password '"$DB_PWD"';"
-  sudo -u postgres psql -c "GRANT ALL privileges ON DATABASE $DB_NAME TO $DB_USER;"
+  sudo -u postgres psql -c "CREATE DATABASE $DB_NAME OWNER $DB_USER;"
+}
+
+create_mssql_db(){
+  ${MSSQL/ -d $DB_NAME/} -b -Q "IF NOT EXISTS (SELECT * FROM sys.databases WHERE name = '$DB_NAME') BEGIN CREATE DATABASE [$DB_NAME]; END"
 }
 
 create_db_tbl() {
@@ -370,6 +462,12 @@ create_db_tbl() {
     ;;
     "mariadb"|"mysql")
       create_mysql_tbl
+    ;;
+    "mssql")
+      create_mssql_tbl
+    ;;
+    "oracle")
+      create_oracle_tbl
     ;;
   esac
 }
@@ -382,7 +480,29 @@ upgrade_db_tbl() {
     "mariadb"|"mysql")
       upgrade_mysql_tbl
     ;;
+    "mssql")
+      upgrade_mssql_tbl
+    ;;
+    "oracle")
+      upgrade_oracle_tbl
+    ;;
   esac
+}
+
+postgresql_check_schema(){
+    DB_SCHEMA=${DB_SCHEMA:-$(${JSON} services.CoAuthoring.sql.pgPoolExtraOptions.options 2>/dev/null | sed -n 's/.*search_path=\([^, ]*\).*/\1/p')}
+    if [ -n "${DB_SCHEMA}" ]; then
+      export PGOPTIONS="-c search_path=${DB_SCHEMA}"
+      $PSQL -c "CREATE SCHEMA IF NOT EXISTS ${DB_SCHEMA};" >/dev/null 2>&1
+      ${JSON} -I -e "this.services.CoAuthoring.sql.pgPoolExtraOptions ||= {}; this.services.CoAuthoring.sql.pgPoolExtraOptions.options = '${PGOPTIONS}'"
+    fi
+}
+
+mssql_check_schema(){
+  if [ -n "${DB_SCHEMA}" ]; then
+    ${MSSQL} -b -Q "DECLARE @s sysname=N'${DB_SCHEMA}'; IF SCHEMA_ID(@s) IS NULL BEGIN DECLARE @sql nvarchar(max); SET @sql=N'CREATE SCHEMA '+QUOTENAME(@s)+N' AUTHORIZATION '+QUOTENAME(N'${DB_USER}'); EXEC(@sql); END"
+    ${MSSQL} -b -Q "DECLARE @s sysname=N'${DB_SCHEMA}'; DECLARE @u sysname=N'${DB_USER}'; IF USER_ID(@u) IS NOT NULL BEGIN DECLARE @sql nvarchar(max); SET @sql=N'ALTER USER '+QUOTENAME(@u)+N' WITH DEFAULT_SCHEMA = '+QUOTENAME(@s); EXEC(@sql); END"
+  fi
 }
 
 upgrade_postgresql_tbl() {
@@ -392,6 +512,7 @@ upgrade_postgresql_tbl() {
 
   PSQL="psql -q -h$DB_HOST -p$DB_PORT -d$DB_NAME -U$DB_USER -w"
 
+  postgresql_check_schema
   $PSQL -f "$APP_DIR/server/schema/postgresql/removetbl.sql"
   $PSQL -f "$APP_DIR/server/schema/postgresql/createdb.sql"
 }
@@ -404,12 +525,33 @@ upgrade_mysql_tbl() {
   $MYSQL $DB_NAME < "$APP_DIR/server/schema/mysql/createdb.sql" >/dev/null 2>&1
 }
 
+upgrade_mssql_tbl() {
+  if [ -n "$DB_PWD" ]; then
+    export SQLCMDPASSWORD=$DB_PWD
+  fi
+
+  MSSQL="/opt/mssql-tools18/bin/sqlcmd -S $DB_HOST,$DB_PORT -d $DB_NAME -U $DB_USER -C"
+
+  mssql_check_schema
+  $MSSQL < "$APP_DIR/server/schema/mssql/removetbl.sql" >/dev/null 2>&1
+  $MSSQL < "$APP_DIR/server/schema/mssql/createdb.sql" >/dev/null 2>&1
+}
+
+upgrade_oracle_tbl() {
+  ORACLE_SQL="sqlplus $DB_USER/$DB_PWD@//$DB_HOST:$DB_PORT/${DB_NAME}"
+
+  $ORACLE_SQL @$APP_DIR/server/schema/oracle/removetbl.sql >/dev/null 2>&1
+  $ORACLE_SQL @$APP_DIR/server/schema/oracle/createdb.sql >/dev/null 2>&1
+}
+
 create_postgresql_tbl() {
   if [ -n "$DB_PWD" ]; then
     export PGPASSWORD=$DB_PWD
   fi
 
   PSQL="psql -q -h$DB_HOST -p$DB_PORT -d$DB_NAME -U$DB_USER -w"
+
+  postgresql_check_schema
   $PSQL -f "$APP_DIR/server/schema/postgresql/createdb.sql"
 }
 
@@ -421,6 +563,24 @@ create_mysql_tbl() {
   $MYSQL -e "CREATE DATABASE IF NOT EXISTS $DB_NAME DEFAULT CHARACTER SET utf8 DEFAULT COLLATE utf8_general_ci;" >/dev/null 2>&1
 
   $MYSQL $DB_NAME < "$APP_DIR/server/schema/mysql/createdb.sql" >/dev/null 2>&1
+}
+
+create_mssql_tbl() {  
+  if [ -n "$DB_PWD" ]; then
+    export SQLCMDPASSWORD=$DB_PWD
+  fi
+
+  MSSQL="/opt/mssql-tools18/bin/sqlcmd -S $DB_HOST,$DB_PORT -d $DB_NAME -U $DB_USER -C"
+
+  create_mssql_db
+  mssql_check_schema
+  $MSSQL < "$APP_DIR/server/schema/mssql/createdb.sql" >/dev/null 2>&1
+}
+
+create_oracle_tbl() {
+  ORACLE_SQL="sqlplus $DB_USER/$DB_PWD@//$DB_HOST:$DB_PORT/${DB_NAME}"
+
+  $ORACLE_SQL @$APP_DIR/server/schema/oracle/createdb.sql >/dev/null 2>&1
 }
 
 update_welcome_page() {
@@ -445,7 +605,13 @@ update_nginx_settings(){
   # Set up nginx
   sed 's/^worker_processes.*/'"worker_processes ${NGINX_WORKER_PROCESSES};"'/' -i ${NGINX_CONFIG_PATH}
   sed 's/worker_connections.*/'"worker_connections ${NGINX_WORKER_CONNECTIONS};"'/' -i ${NGINX_CONFIG_PATH}
-  sed 's/access_log.*/'"access_log off;"'/' -i ${NGINX_CONFIG_PATH}
+
+  if [ "${NGINX_ACCESS_LOG}" = "true" ]; then
+    touch "${DS_LOG_DIR}/nginx.access.log"
+    sed -ri 's|^\s*access_log\b.*;|access_log '"${DS_LOG_DIR}"'/nginx.access.log;|' "${NGINX_CONFIG_PATH}" "${NGINX_ONLYOFFICE_PATH}/includes/ds-common.conf" 2>/dev/null
+  else
+    sed -ri 's|^\s*access_log\b.*;|access_log off;|' "${NGINX_CONFIG_PATH}"
+  fi
 
   # setup HTTPS
   if [ -f "${SSL_CERTIFICATE_PATH}" -a -f "${SSL_KEY_PATH}" ]; then
@@ -489,16 +655,7 @@ update_nginx_settings(){
     sed 's/linux/docker/' -i ${NGINX_ONLYOFFICE_EXAMPLE_CONF}
   fi
 
-  documentserver-update-securelink.sh -s ${SECURE_LINK_SECRET:-$(pwgen -s 20)} -r false
-}
-
-update_supervisor_settings(){
-  # Copy modified supervisor start script
-  cp ${SYSCONF_TEMPLATES_DIR}/supervisor/supervisor /etc/init.d/
-  # Copy modified supervisor config
-  cp ${SYSCONF_TEMPLATES_DIR}/supervisor/supervisord.conf /etc/supervisor/supervisord.conf
-  sed "s/COMPANY_NAME/${COMPANY_NAME}/g" -i ${SYSCONF_TEMPLATES_DIR}/supervisor/ds/*.conf
-  cp ${SYSCONF_TEMPLATES_DIR}/supervisor/ds/*.conf etc/supervisor/conf.d/
+  start_process documentserver-update-securelink.sh -s ${SECURE_LINK_SECRET:-$(pwgen -s 20)} -r false
 }
 
 update_log_settings(){
@@ -515,11 +672,11 @@ update_release_date(){
 }
 
 # create base folders
-for i in converter docservice metrics; do
-  mkdir -p "${DS_LOG_DIR}/$i"
+for i in converter docservice metrics adminpanel; do
+  mkdir -p "$DS_LOG_DIR/$i" && touch "$DS_LOG_DIR/$i"/{out,err}.log
 done
 
-mkdir -p ${DS_LOG_DIR}-example
+mkdir -p "${DS_LOG_DIR}-example" && touch "${DS_LOG_DIR}-example"/{out,err}.log
 
 # create app folders
 for i in ${DS_LIB_DIR}/App_Data/cache/files ${DS_LIB_DIR}/App_Data/docbuilder ${DS_LIB_DIR}-example/files; do
@@ -527,10 +684,15 @@ for i in ${DS_LIB_DIR}/App_Data/cache/files ${DS_LIB_DIR}/App_Data/docbuilder ${
 done
 
 # change folder rights
-for i in ${LOG_DIR} ${LIB_DIR}; do
+chown ds:ds "${DATA_DIR}"
+for i in ${DS_LOG_DIR} ${DS_LOG_DIR}-example ${LIB_DIR}; do
   chown -R ds:ds "$i"
   chmod -R 755 "$i"
 done
+
+# Bug 75324 - Update permissions for runtime.json
+AI_CONFIG_FILE="${DATA_DIR}/runtime.json"
+[ -f "${AI_CONFIG_FILE}" ] && { chown ds:ds "${AI_CONFIG_FILE}" && chmod 644 "${AI_CONFIG_FILE}"; }
 
 if [ ${ONLYOFFICE_DATA_CONTAINER_HOST} = "localhost" ]; then
 
@@ -574,6 +736,8 @@ if [ ${ONLYOFFICE_DATA_CONTAINER_HOST} = "localhost" ]; then
         chmod 400 ${RABBITMQ_DATA}/.erlang.cookie
     fi
 
+    echo "ulimit -n $RABBIT_CONNECTIONS" >> /etc/default/rabbitmq-server
+
     LOCAL_SERVICES+=("rabbitmq-server")
     # allow Rabbitmq startup after container kill
     rm -rf /var/run/rabbitmq
@@ -601,7 +765,7 @@ else
   update_welcome_page
 fi
 
-find /etc/${COMPANY_NAME} -exec chown ds:ds {} \;
+find /etc/${COMPANY_NAME} ! -path '*logrotate*' -exec chown ds:ds {} \;
 
 #start needed local services
 for i in ${LOCAL_SERVICES[@]}; do
@@ -626,8 +790,7 @@ if [ ${ONLYOFFICE_DATA_CONTAINER} != "true" ]; then
   fi
 
   update_nginx_settings
-
-  update_supervisor_settings
+  
   service supervisor start
   
   # start cron to enable log rotating
@@ -635,23 +798,32 @@ if [ ${ONLYOFFICE_DATA_CONTAINER} != "true" ]; then
   service cron start
 fi
 
+# Fix to resolve the `unknown "cache_tag" variable` error
+start_process documentserver-flush-cache.sh -r false
+
 # nginx used as a proxy, and as data container status service.
 # it run in all cases.
 service nginx start
 
 if [ "${LETS_ENCRYPT_DOMAIN}" != "" -a "${LETS_ENCRYPT_MAIL}" != "" ]; then
   if [ ! -f "${SSL_CERTIFICATE_PATH}" -a ! -f "${SSL_KEY_PATH}" ]; then
-    documentserver-letsencrypt.sh ${LETS_ENCRYPT_MAIL} ${LETS_ENCRYPT_DOMAIN}
+    start_process documentserver-letsencrypt.sh ${LETS_ENCRYPT_MAIL} ${LETS_ENCRYPT_DOMAIN}
   fi
 fi
 
 # Regenerate the fonts list and the fonts thumbnails
 if [ "${GENERATE_FONTS}" == "true" ]; then
-  documentserver-generate-allfonts.sh ${ONLYOFFICE_DATA_CONTAINER}
+  start_process documentserver-generate-allfonts.sh ${ONLYOFFICE_DATA_CONTAINER}
 fi
-documentserver-static-gzip.sh ${ONLYOFFICE_DATA_CONTAINER}
+
+if [ "${PLUGINS_ENABLED}" = "true" ]; then
+  echo -n Installing plugins, please wait...
+  start_process documentserver-pluginsmanager.sh -r false --update=\"${APP_DIR}/sdkjs-plugins/plugin-list-default.json\" >/dev/null
+  echo Done
+fi
+
+start_process documentserver-static-gzip.sh ${ONLYOFFICE_DATA_CONTAINER}
 
 echo "${JWT_MESSAGE}" 
 
-tail -f /var/log/${COMPANY_NAME}/**/*.log &
-wait $!
+start_process find "$DS_LOG_DIR" "$DS_LOG_DIR-example" -type f -name "*.log" | xargs tail -F
