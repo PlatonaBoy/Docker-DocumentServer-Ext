@@ -1,11 +1,15 @@
-ARG BASE_IMAGE=ubuntu:22.04
+ARG BASE_VERSION=24.04
+
+ARG BASE_IMAGE=ubuntu:$BASE_VERSION
 
 FROM ${BASE_IMAGE} as documentserver
 LABEL maintainer Ascensio System SIA <support@onlyoffice.com>
 
-ARG PG_VERSION=14
+ARG BASE_VERSION
+ARG PG_VERSION=16
+ARG PACKAGE_SUFFIX=t64
 
-ENV LANG=en_US.UTF-8 LANGUAGE=en_US:en LC_ALL=en_US.UTF-8 DEBIAN_FRONTEND=noninteractive PG_VERSION=${PG_VERSION}
+ENV LANG=en_US.UTF-8 LANGUAGE=en_US:en LC_ALL=en_US.UTF-8 DEBIAN_FRONTEND=noninteractive PG_VERSION=${PG_VERSION} BASE_VERSION=${BASE_VERSION}
 
 ARG ONLYOFFICE_VALUE=onlyoffice
 
@@ -19,10 +23,12 @@ RUN echo "#!/bin/sh\nexit 0" > /usr/sbin/policy-rc.d && \
         apt-utils \
         bomstrip \
         certbot \
+        cron \
         curl \
         gconf-service \
         htop \
-        libasound2 \
+        libaio1${PACKAGE_SUFFIX} \
+        libasound2${PACKAGE_SUFFIX} \
         libboost-regex-dev \
         libcairo2 \
         libcurl3-gnutls \
@@ -48,8 +54,12 @@ RUN echo "#!/bin/sh\nexit 0" > /usr/sbin/policy-rc.d && \
         sudo \
         supervisor \
         ttf-mscorefonts-installer \
+        unixodbc-dev \
+        unzip \
         xvfb \
-        zlib1g && \
+        xxd \
+        zlib1g || dpkg --configure -a && \
+    # Added dpkg --configure -a to handle installation issues with rabbitmq-server on arm64 architecture
     if [  $(ls -l /usr/share/fonts/truetype/msttcorefonts | wc -l) -ne 61 ]; \
         then echo 'msttcorefonts failed to download'; exit 1; fi  && \
     echo "SERVER_ADDITIONAL_ERL_ARGS=\"+S 1:1\"" | tee -a /etc/rabbitmq/rabbitmq-env.conf && \
@@ -57,8 +67,8 @@ RUN echo "#!/bin/sh\nexit 0" > /usr/sbin/policy-rc.d && \
     sed 's|\(application\/zip.*\)|\1\n    application\/wasm wasm;|' -i /etc/nginx/mime.types && \
     pg_conftool $PG_VERSION main set listen_addresses 'localhost' && \
     service postgresql restart && \
-    sudo -u postgres psql -c "CREATE DATABASE $ONLYOFFICE_VALUE;" && \
     sudo -u postgres psql -c "CREATE USER $ONLYOFFICE_VALUE WITH password '$ONLYOFFICE_VALUE';" && \
+    sudo -u postgres psql -c "CREATE DATABASE $ONLYOFFICE_VALUE OWNER $ONLYOFFICE_VALUE;" && \
     sudo -u postgres psql -c "GRANT ALL privileges ON DATABASE $ONLYOFFICE_VALUE TO $ONLYOFFICE_VALUE;" && \ 
     service postgresql stop && \
     service redis-server stop && \
@@ -69,6 +79,7 @@ RUN echo "#!/bin/sh\nexit 0" > /usr/sbin/policy-rc.d && \
 
 COPY config /app/ds/setup/config/
 COPY run-document-server.sh /app/ds/run-document-server.sh
+COPY onlyoffice.deb /tmp/onlyoffice.deb
 
 EXPOSE 80 443
 
@@ -84,8 +95,7 @@ ENV COMPANY_NAME=$COMPANY_NAME \
     PRODUCT_EDITION=$PRODUCT_EDITION \
     DS_DOCKER_INSTALLATION=true
 
-RUN PACKAGE_FILE="${COMPANY_NAME}-${PRODUCT_NAME}${PRODUCT_EDITION}${PACKAGE_VERSION:+_$PACKAGE_VERSION}_${TARGETARCH:-$(dpkg --print-architecture)}.deb" && \
-    wget -q -P /tmp "$PACKAGE_BASEURL/$PACKAGE_FILE" && \
+RUN PACKAGE_FILE="onlyoffice.deb" && \
     apt-get -y update && \
     service postgresql start && \
     apt-get -yq install /tmp/$PACKAGE_FILE && \

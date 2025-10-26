@@ -76,7 +76,7 @@ NGINX_WORKER_PROCESSES=${NGINX_WORKER_PROCESSES:-1}
 # Limiting the maximum number of simultaneous connections due to possible memory shortage
 [ $(ulimit -n) -gt 1048576 ] && NGINX_WORKER_CONNECTIONS=${NGINX_WORKER_CONNECTIONS:-1048576} || NGINX_WORKER_CONNECTIONS=${NGINX_WORKER_CONNECTIONS:-$(ulimit -n)}
 
-JWT_ENABLED=${JWT_ENABLED:-true}
+JWT_ENABLED=${JWT_ENABLED:-false}
 
 # validate user's vars before usinig in json
 if [ "${JWT_ENABLED}" == "true" ]; then
@@ -87,7 +87,7 @@ fi
 
 [ -z $JWT_SECRET ] && JWT_MESSAGE='JWT is enabled by default. A random secret is generated automatically. Run the command "docker exec $(sudo docker ps -q) sudo documentserver-jwt-status.sh" to get information about JWT.'
 
-JWT_SECRET=${JWT_SECRET:-$(pwgen -s 20)}
+JWT_SECRET=${JWT_SECRET:-$(pwgen -s 32)}
 JWT_HEADER=${JWT_HEADER:-Authorization}
 JWT_IN_BODY=${JWT_IN_BODY:-false}
 
